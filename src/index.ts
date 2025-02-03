@@ -16,7 +16,7 @@ interface Config {
 const CONFIG: Config = {
   MONGO_URI: "mongodb://localhost:27017/tocgame",
   CHECK_INTERVAL: 300000, // 5 minutos
-  BACKUP_DIR: "/backups",
+  BACKUP_DIR: "~/backups",
   // BACKUP_DIR: "/var/backups/tocgamedb",
   SALES_COLLECTION: "sales",
   BACKUPS_COLLECTION: "backups",
