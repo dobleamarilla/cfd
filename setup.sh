@@ -4,7 +4,8 @@
 sudo mkdir -p /var/backups/tocgamedb
 sudo chown -R $USER:$USER /var/backups/tocgamedb
 
-# Dar permisos para ejecutar zenity como root (si es necesario)
-echo 'Defaults:root !' | sudo tee -a /etc/sudoers
+# Crear configuración de sudoers segura
+echo 'Defaults:root !requiretty' | sudo tee /etc/sudoers.d/disaster-recovery
+sudo chmod 0440 /etc/sudoers.d/disaster-recovery
 
-echo "Setup completado."
+echo "Setup completado correctamente."
