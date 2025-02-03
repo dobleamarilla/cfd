@@ -16,7 +16,8 @@ interface Config {
 const CONFIG: Config = {
   MONGO_URI: "mongodb://localhost:27017/tocgame",
   CHECK_INTERVAL: 300000, // 5 minutos
-  BACKUP_DIR: "/var/backups/tocgamedb",
+  BACKUP_DIR: "/backups",
+  // BACKUP_DIR: "/var/backups/tocgamedb",
   SALES_COLLECTION: "sales",
   BACKUPS_COLLECTION: "backups",
 };
@@ -94,14 +95,14 @@ class DisasterRecoveryManager {
     try {
       // 1. Ejecutar mongodump dentro del contenedor
       execSync(
-        `docker exec mongodb mongodump --uri="${this.config.MONGO_URI}" --out="/tmp/${backupName}"`,
+        `docker exec mongodb mongodump --uri="${this.config.MONGO_URI}" --out="${this.config.BACKUP_DIR}/${backupName}"`,
         { stdio: "inherit" }
       );
 
-      // 2. Copiar el backup al host
-      execSync(`docker cp mongodb:/tmp/${backupName} ${backupPath}`, {
-        stdio: "inherit",
-      });
+      // // 2. Copiar el backup al host
+      // execSync(`docker cp mongodb:/tmp/${backupName} ${backupPath}`, {
+      //   stdio: "inherit",
+      // });
 
       // 3. Limpiar el backup temporal del contenedor
       execSync(`docker exec mongodb rm -rf /tmp/${backupName}`, {
@@ -139,12 +140,16 @@ class DisasterRecoveryManager {
         const hasRecentSales = await this.checkRecentSales();
 
         if (!hasRecentSales) {
-          const needsHelp = this.showDialog();
+          const hasProblems = this.showDialog();
 
-          if (needsHelp) {
+          if (!hasProblems) {
+            // Si NO hay problemas reportados -> Crear backup
             await this.createBackup();
-            console.log("Backup de emergencia creado");
-            // Lógica adicional para cambiar al backup
+            console.log("Backup preventivo creado");
+          } else {
+            // Si HAY problemas reportados -> Restaurar último backup
+            await this.restoreFromLatestBackup();
+            console.log("Sistema restaurado desde el último backup");
           }
         }
       } catch (error) {
@@ -154,6 +159,42 @@ class DisasterRecoveryManager {
       await new Promise((resolve) =>
         setTimeout(resolve, this.config.CHECK_INTERVAL)
       );
+    }
+  }
+
+  private async restoreFromLatestBackup(): Promise<void> {
+    const client = new MongoClient(this.config.MONGO_URI);
+
+    try {
+      await client.connect();
+      const database: Db = client.db();
+      const collection: Collection<BackupRecord> = database.collection(
+        this.config.BACKUPS_COLLECTION
+      );
+
+      // Buscar el último backup válido
+      const latestBackup = await collection.findOne(
+        { status: "created" },
+        { sort: { createdAt: -1 } }
+      );
+
+      if (!latestBackup) {
+        throw new Error("No hay backups disponibles para restaurar");
+      }
+
+      // Restaurar el backup
+      execSync(
+        `docker exec mongodb mongorestore --uri="${this.config.MONGO_URI}" --dir="${latestBackup.path}" --drop`,
+        { stdio: "inherit" }
+      );
+
+      // Actualizar estado del backup
+      await collection.updateOne(
+        { _id: latestBackup._id },
+        { $set: { status: "restored" } }
+      );
+    } finally {
+      await client.close();
     }
   }
 }
