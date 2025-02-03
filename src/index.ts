@@ -90,12 +90,23 @@ class DisasterRecoveryManager {
     const backupName = `backup-${timestamp}`;
     const backupPath = join(this.config.BACKUP_DIR, backupName);
 
-    // Crear dump de MongoDB
+    // Crear dump de MongoDB dentro del contenedor
     try {
+      // 1. Ejecutar mongodump dentro del contenedor
       execSync(
-        `mongodump --uri="${this.config.MONGO_URI}" --out="${backupPath}"`,
+        `docker exec mongo mongodump --uri="${this.config.MONGO_URI}" --out="/tmp/${backupName}"`,
         { stdio: "inherit" }
       );
+
+      // 2. Copiar el backup al host
+      execSync(`docker cp mongo:/tmp/${backupName} ${backupPath}`, {
+        stdio: "inherit",
+      });
+
+      // 3. Limpiar el backup temporal del contenedor
+      execSync(`docker exec mongo rm -rf /tmp/${backupName}`, {
+        stdio: "inherit",
+      });
     } catch (error) {
       console.error("Error creating MongoDB dump:", error);
       throw error;
