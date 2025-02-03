@@ -94,17 +94,17 @@ class DisasterRecoveryManager {
     try {
       // 1. Ejecutar mongodump dentro del contenedor
       execSync(
-        `docker exec mongo mongodump --uri="${this.config.MONGO_URI}" --out="/tmp/${backupName}"`,
+        `docker exec mongodb mongodump --uri="${this.config.MONGO_URI}" --out="/tmp/${backupName}"`,
         { stdio: "inherit" }
       );
 
       // 2. Copiar el backup al host
-      execSync(`docker cp mongo:/tmp/${backupName} ${backupPath}`, {
+      execSync(`docker cp mongodb:/tmp/${backupName} ${backupPath}`, {
         stdio: "inherit",
       });
 
       // 3. Limpiar el backup temporal del contenedor
-      execSync(`docker exec mongo rm -rf /tmp/${backupName}`, {
+      execSync(`docker exec mongodb rm -rf /tmp/${backupName}`, {
         stdio: "inherit",
       });
     } catch (error) {
