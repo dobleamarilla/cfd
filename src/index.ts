@@ -1,7 +1,7 @@
-import { MongoClient, Db, Collection } from "mongodb";
+import { MongoClient } from "mongodb";
 import { execSync } from "child_process";
 import { format } from "date-fns";
-import { existsSync, mkdirSync } from "fs";
+import { existsSync, mkdirSync, writeFileSync } from "fs";
 import { join } from "path";
 import { homedir } from "os";
 import { createLogger, format as winstonFormat, transports } from "winston";
@@ -43,6 +43,7 @@ interface Sale {
 }
 
 interface BackupRecord {
+  _id?: any; // Puede ser ObjectId u otro tipo según tu configuración
   filename: string;
   path: string;
   createdAt: Date;
@@ -51,8 +52,6 @@ interface BackupRecord {
 }
 
 class DisasterRecoverySystem {
-  private dbClient?: MongoClient;
-
   constructor() {
     this.ensureBackupDir();
   }
@@ -71,16 +70,13 @@ class DisasterRecoverySystem {
 
   public async checkRecentSales(): Promise<boolean> {
     const client = new MongoClient(CONFIG.MONGO_URI);
-
     try {
       await client.connect();
       const collection = client.db().collection<Sale>(CONFIG.SALES_COLLECTION);
       const fiveMinutesAgo = new Date(Date.now() - CONFIG.CHECK_INTERVAL);
-
       const count = await collection.countDocuments({
         createdAt: { $gte: fiveMinutesAgo },
       });
-
       return count > 0;
     } finally {
       await client.close();
@@ -110,17 +106,16 @@ class DisasterRecoverySystem {
     try {
       logger.info(`Iniciando backup: ${backupPath}`);
 
-      // 1. Crear dump comprimido directamente desde el volumen
-      execSync(
-        `docker exec ${CONFIG.CONTAINER_NAME} ` +
-          `mongodump --uri="${CONFIG.MONGO_URI}" ` +
-          `--archive --gzip > ${backupPath}`,
-        { stdio: "pipe" }
+      // Capturamos la salida del comando mongodump
+      const dump = execSync(
+        `docker exec ${CONFIG.CONTAINER_NAME} mongodump --uri="${CONFIG.MONGO_URI}" --archive --gzip`
       );
 
-      // 2. Registrar en MongoDB
-      const stats = await this.registerBackup(backupFile, backupPath);
+      // Escribimos el dump en el archivo de backup
+      writeFileSync(backupPath, dump);
 
+      // Registrar el backup en MongoDB
+      const stats = await this.registerBackup(backupFile, backupPath);
       logger.info(`Backup exitoso: ${stats.sizeMB}MB`);
       return backupPath;
     } catch (error) {
@@ -134,14 +129,12 @@ class DisasterRecoverySystem {
     path: string
   ): Promise<{ sizeMB: number }> {
     const client = new MongoClient(CONFIG.MONGO_URI);
-
     try {
       await client.connect();
       const stats = await this.getFileStats(path);
       const collection = client
         .db()
         .collection<BackupRecord>(CONFIG.BACKUPS_COLLECTION);
-
       await collection.insertOne({
         filename,
         path,
@@ -149,7 +142,6 @@ class DisasterRecoverySystem {
         sizeMB: stats.sizeMB,
         status: "created",
       });
-
       return stats;
     } finally {
       await client.close();
@@ -157,13 +149,12 @@ class DisasterRecoverySystem {
   }
 
   private async getFileStats(path: string): Promise<{ sizeMB: number }> {
-    const stats = execSync(`du -m "${path}" | cut -f1`).toString().trim();
-    return { sizeMB: parseInt(stats) || 0 };
+    const statsStr = execSync(`du -m "${path}" | cut -f1`).toString().trim();
+    return { sizeMB: parseInt(statsStr) || 0 };
   }
 
   public async restoreLatestBackup(): Promise<void> {
     const client = new MongoClient(CONFIG.MONGO_URI);
-
     try {
       await client.connect();
       const collection = client
@@ -181,26 +172,30 @@ class DisasterRecoverySystem {
 
       logger.info(`Iniciando restauración desde: ${backup.filename}`);
 
-      // 1. Detener contenedor
+      // Detener contenedor
       execSync(`docker stop ${CONFIG.CONTAINER_NAME}`, { stdio: "inherit" });
 
-      // 2. Restaurar volumen
-      execSync(
-        `docker run --rm -v ${CONFIG.DOCKER_VOLUME}:/data/db ` +
-          `-v ${CONFIG.BACKUP_DIR}:/backups mongo ` +
-          `bash -c "mongorestore --uri='${CONFIG.MONGO_URI}' --gzip --archive=/backups/${backup.filename}"`,
-        { stdio: "inherit" }
-      );
+      // Esperar unos segundos para que el contenedor se detenga completamente
+      await this.delay(3000);
 
-      // 3. Actualizar estado
+      // Construir y ejecutar el comando de restauración
+      const restoreCmd = [
+        "docker run --rm",
+        `-v ${CONFIG.DOCKER_VOLUME}:/data/db`,
+        `-v ${CONFIG.BACKUP_DIR}:/backups`,
+        "mongo",
+        `bash -c "mongorestore --uri='${CONFIG.MONGO_URI}' --gzip --archive=/backups/${backup.filename}"`,
+      ].join(" ");
+      execSync(restoreCmd, { stdio: "inherit" });
+
+      // Actualizar el estado del backup a "restored"
       await collection.updateOne(
         { _id: backup._id },
         { $set: { status: "restored" } }
       );
 
-      // 4. Reiniciar contenedor
+      // Reiniciar contenedor
       execSync(`docker start ${CONFIG.CONTAINER_NAME}`, { stdio: "inherit" });
-
       logger.info("Restauración completada exitosamente");
     } catch (error) {
       logger.error("Error en restauración:", error);
@@ -212,14 +207,11 @@ class DisasterRecoverySystem {
 
   public async startMonitoring(): Promise<void> {
     logger.info("Iniciando sistema de monitorización...");
-
     while (true) {
       try {
         const hasSales = await this.checkRecentSales();
-
         if (!hasSales) {
           const hasProblems = this.showDialog();
-
           if (hasProblems) {
             logger.warn("Problemas detectados - Restaurando último backup");
             await this.restoreLatestBackup();
@@ -228,7 +220,6 @@ class DisasterRecoverySystem {
             await this.createVolumeBackup();
           }
         }
-
         await this.delay(CONFIG.CHECK_INTERVAL);
       } catch (error) {
         logger.error("Error en ciclo de monitorización:", error);
