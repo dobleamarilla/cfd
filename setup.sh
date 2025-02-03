@@ -1,36 +1,50 @@
 #!/bin/bash
 
-# Configuración segura de permisos y directorios
+# Configurar entorno de backups
 BACKUP_DIR="$HOME/backups/tocgamedb"
+LOG_DIR="$PWD/logs"
 
-# 1. Crear directorio de backups sin sudo
-mkdir -p "$BACKUP_DIR"
-chmod 775 "$BACKUP_DIR"
+# 1. Crear directorios con permisos
+mkdir -p "$BACKUP_DIR" "$LOG_DIR"
+chmod 755 "$BACKUP_DIR"
+chmod 755 "$LOG_DIR"
 
-sudo chown -R $USER:docker "$BACKUP_DIR"
-
-# 2. Configurar permisos de Docker (evitar usar sudo)
-sudo groupadd docker 2>/dev/null  # Ignorar si ya existe
+# 2. Configurar Docker
+sudo groupadd docker 2>/dev/null
 sudo usermod -aG docker $USER
 
-# 3. Configuración sudoers segura
-sudo setfacl -Rdm g:docker:rwx "$BACKUP_DIR"
+# 3. Instalar dependencias
+sudo apt-get update
+sudo apt-get install -y \
+  mongodb-org-tools \
+  zenity \
+  docker.io
 
-SUDOERS_FILE="/etc/sudoers.d/disaster-recovery"
-echo "Defaults:$USER !requiretty" | sudo tee "$SUDOERS_FILE" >/dev/null
-echo "$USER ALL=(root) NOPASSWD: /usr/bin/docker exec *" | sudo tee -a "$SUDOERS_FILE" >/dev/null
-sudo chmod 0440 "$SUDOERS_FILE"
+# 4. Configurar servicio systemd
+SERVICE_FILE="/etc/systemd/system/toc-monitor.service"
+sudo tee "$SERVICE_FILE" > /dev/null <<EOL
+[Unit]
+Description=TOC Disaster Recovery Monitor
+After=docker.service
 
-# 4. Configurar política SELinux (si aplica)
-if command -v sestatus &> /dev/null; then
-    sudo setenforce 0
-    sudo semanage fcontext -a -t container_file_t "$BACKUP_DIR(/.*)?"
-    sudo restorecon -Rv "$BACKUP_DIR"
-fi
+[Service]
+User=$USER
+WorkingDirectory=$PWD
+ExecStart=$(which node) dist/index.js
+Restart=always
+Environment="MONGO_URI=mongodb://localhost:27017/tocgame"
+Environment="BACKUP_DIR=$BACKUP_DIR"
 
-# 5. Aplicar cambios de grupos
-newgrp docker <<EONG
-echo "Configuración completada:"
-echo " - Directorio de backups: $BACKUP_DIR"
-echo " - Usuario $USER agregado al grupo docker"
-EONG
+[Install]
+WantedBy=multi-user.target
+EOL
+
+# 5. Recargar e iniciar servicio
+sudo systemctl daemon-reload
+sudo systemctl enable toc-monitor
+sudo systemctl start toc-monitor
+
+echo "Configuración completada"
+echo " - Backups: $BACKUP_DIR"
+echo " - Logs: $LOG_DIR"
+echo " - Servicio: toc-monitor"

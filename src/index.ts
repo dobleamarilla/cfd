@@ -4,193 +4,206 @@ import { format } from "date-fns";
 import { existsSync, mkdirSync } from "fs";
 import { join } from "path";
 import { homedir } from "os";
+import { createLogger, format as winstonFormat, transports } from "winston";
 
-// Configuración con tipos
-interface Config {
-  MONGO_URI: string;
-  CHECK_INTERVAL: number;
-  HOST_BACKUP_DIR: string;
-  CONTAINER_BACKUP_DIR: string;
-  SALES_COLLECTION: string;
-  BACKUPS_COLLECTION: string;
-  CONTAINER_NAME: string;
-}
-
-const CONFIG: Config = {
-  MONGO_URI: "mongodb://localhost:27017/tocgame",
-  CHECK_INTERVAL: 300000, // 5 minutos
-  HOST_BACKUP_DIR: join(homedir(), "backups"),
-  CONTAINER_BACKUP_DIR: "/tmp/mongobackups",
+// Configuración principal
+const CONFIG = {
+  MONGO_URI: process.env.MONGO_URI || "mongodb://localhost:27017/tocgame",
+  DOCKER_VOLUME: process.env.DOCKER_VOLUME || "mongo_data",
+  CONTAINER_NAME: process.env.CONTAINER_NAME || "mongodb",
+  BACKUP_DIR: process.env.BACKUP_DIR || join(homedir(), "backups/tocgamedb"),
+  CHECK_INTERVAL: parseInt(process.env.CHECK_INTERVAL || "300000"), // 5 minutos
   SALES_COLLECTION: "sales",
   BACKUPS_COLLECTION: "backups",
-  CONTAINER_NAME: "mongodb", // Verificar nombre del contenedor con 'docker ps'
 };
 
-// Tipos para los documentos de MongoDB
+// Configurar logger
+const logger = createLogger({
+  level: "info",
+  format: winstonFormat.combine(
+    winstonFormat.timestamp(),
+    winstonFormat.json()
+  ),
+  transports: [
+    new transports.File({ filename: "logs/error.log", level: "error" }),
+    new transports.File({ filename: "logs/combined.log" }),
+    new transports.Console({
+      format: winstonFormat.combine(
+        winstonFormat.colorize(),
+        winstonFormat.simple()
+      ),
+    }),
+  ],
+});
+
+// Tipos de datos
 interface Sale {
   _id: string;
   createdAt: Date;
 }
 
 interface BackupRecord {
+  filename: string;
   path: string;
   createdAt: Date;
-  type: "emergency" | "scheduled";
-  status: "created" | "failed" | "restored";
+  sizeMB: number;
+  status: "created" | "restored" | "failed";
 }
 
-class DisasterRecoveryManager {
+class DisasterRecoverySystem {
   private dbClient?: MongoClient;
 
-  constructor(private config: Config) {
+  constructor() {
     this.ensureBackupDir();
   }
 
   private ensureBackupDir(): void {
-    if (!existsSync(this.config.HOST_BACKUP_DIR)) {
-      mkdirSync(this.config.HOST_BACKUP_DIR, { recursive: true, mode: 0o755 });
+    try {
+      if (!existsSync(CONFIG.BACKUP_DIR)) {
+        mkdirSync(CONFIG.BACKUP_DIR, { recursive: true, mode: 0o755 });
+        logger.info(`Directorio de backups creado: ${CONFIG.BACKUP_DIR}`);
+      }
+    } catch (error) {
+      logger.error("Error creando directorio de backups:", error);
+      throw error;
     }
   }
 
   public async checkRecentSales(): Promise<boolean> {
-    this.dbClient = new MongoClient(this.config.MONGO_URI);
+    const client = new MongoClient(CONFIG.MONGO_URI);
 
     try {
-      await this.dbClient.connect();
-      const database: Db = this.dbClient.db();
-      const collection: Collection<Sale> = database.collection(
-        this.config.SALES_COLLECTION
-      );
+      await client.connect();
+      const collection = client.db().collection<Sale>(CONFIG.SALES_COLLECTION);
+      const fiveMinutesAgo = new Date(Date.now() - CONFIG.CHECK_INTERVAL);
 
-      const fiveMinutesAgo = new Date(Date.now() - this.config.CHECK_INTERVAL);
-
-      const count: number = await collection.countDocuments({
+      const count = await collection.countDocuments({
         createdAt: { $gte: fiveMinutesAgo },
       });
 
       return count > 0;
     } finally {
-      await this.dbClient.close();
+      await client.close();
     }
   }
 
-  public showDialog(): boolean {
+  private showDialog(): boolean {
     try {
       execSync(
         "zenity --question " +
-          '--title="Verificación de sistema" ' +
-          '--text="No se detectaron ventas en los últimos 5 minutos. ¿Está teniendo problemas con el sistema?" ' +
-          "--width=300",
+          '--title="Estado del Sistema" ' +
+          '--text="No se detectaron ventas en 5 minutos. ¿Existen problemas?" ' +
+          '--width=400 --ok-label="Sí" --cancel-label="No"',
         { stdio: "inherit" }
       );
       return true;
-    } catch (error) {
+    } catch {
       return false;
     }
   }
 
-  public async createBackup(): Promise<void> {
+  public async createVolumeBackup(): Promise<string> {
     const timestamp = format(new Date(), "yyyyMMdd-HHmmss");
-    const backupName = `backup-${timestamp}`;
-    const containerBackupPath = `/tmp/mongobackups/${backupName}`;
-    const hostBackupPath = join(this.config.HOST_BACKUP_DIR, backupName);
+    const backupFile = `backup-${timestamp}.gz`;
+    const backupPath = join(CONFIG.BACKUP_DIR, backupFile);
 
     try {
-      // 1. Crear directorio temporal en el contenedor
+      logger.info(`Iniciando backup: ${backupPath}`);
+
+      // 1. Crear dump comprimido directamente desde el volumen
       execSync(
-        `docker exec ${this.config.CONTAINER_NAME} mkdir -p ${containerBackupPath}`,
-        { stdio: "inherit" }
+        `docker exec ${CONFIG.CONTAINER_NAME} ` +
+          `mongodump --uri="${CONFIG.MONGO_URI}" ` +
+          `--archive --gzip > ${backupPath}`,
+        { stdio: "pipe" }
       );
 
-      // 2. Ejecutar mongodump
-      execSync(
-        `docker exec ${this.config.CONTAINER_NAME} ` +
-          `mongodump --uri="${this.config.MONGO_URI}" ` +
-          `--out="${containerBackupPath}"`,
-        { stdio: "inherit" }
-      );
+      // 2. Registrar en MongoDB
+      const stats = await this.registerBackup(backupFile, backupPath);
 
-      // 3. Copiar archivos con preservación de permisos
-      execSync(
-        `docker cp ${this.config.CONTAINER_NAME}:${containerBackupPath} ${hostBackupPath}`,
-        { stdio: "inherit" }
-      );
-
-      // 4. Limpiar contenedor
-      execSync(
-        `docker exec ${this.config.CONTAINER_NAME} rm -rf ${containerBackupPath}`,
-        { stdio: "inherit" }
-      );
-
-      // ... (resto del código de registro)
-    } catch (error: any) {
-      console.error("Detalle del error:", error.stdout?.toString());
+      logger.info(`Backup exitoso: ${stats.sizeMB}MB`);
+      return backupPath;
+    } catch (error) {
+      logger.error("Error en backup:", error);
       throw error;
     }
   }
 
-  private async restoreFromLatestBackup(): Promise<void> {
-    const client = new MongoClient(this.config.MONGO_URI);
+  private async registerBackup(
+    filename: string,
+    path: string
+  ): Promise<{ sizeMB: number }> {
+    const client = new MongoClient(CONFIG.MONGO_URI);
+
+    try {
+      await client.connect();
+      const stats = await this.getFileStats(path);
+      const collection = client
+        .db()
+        .collection<BackupRecord>(CONFIG.BACKUPS_COLLECTION);
+
+      await collection.insertOne({
+        filename,
+        path,
+        createdAt: new Date(),
+        sizeMB: stats.sizeMB,
+        status: "created",
+      });
+
+      return stats;
+    } finally {
+      await client.close();
+    }
+  }
+
+  private async getFileStats(path: string): Promise<{ sizeMB: number }> {
+    const stats = execSync(`du -m "${path}" | cut -f1`).toString().trim();
+    return { sizeMB: parseInt(stats) || 0 };
+  }
+
+  public async restoreLatestBackup(): Promise<void> {
+    const client = new MongoClient(CONFIG.MONGO_URI);
 
     try {
       await client.connect();
       const collection = client
         .db()
-        .collection<BackupRecord>(this.config.BACKUPS_COLLECTION);
+        .collection<BackupRecord>(CONFIG.BACKUPS_COLLECTION);
 
-      const latestBackup = await collection.findOne(
+      const backup = await collection.findOne(
         { status: "created" },
         { sort: { createdAt: -1 } }
       );
 
-      if (!latestBackup) {
-        throw new Error("No hay backups disponibles para restaurar");
+      if (!backup) {
+        throw new Error("No hay backups disponibles");
       }
 
-      // Preparar rutas
-      const backupDirName = latestBackup.path.split("/").pop() || "";
-      const containerRestorePath = join(
-        this.config.CONTAINER_BACKUP_DIR,
-        "restore",
-        backupDirName
-      );
+      logger.info(`Iniciando restauración desde: ${backup.filename}`);
 
-      // 1. Crear directorio temporal en contenedor
+      // 1. Detener contenedor
+      execSync(`docker stop ${CONFIG.CONTAINER_NAME}`, { stdio: "inherit" });
+
+      // 2. Restaurar volumen
       execSync(
-        `docker exec ${this.config.CONTAINER_NAME} mkdir -p ${containerRestorePath}`,
+        `docker run --rm -v ${CONFIG.DOCKER_VOLUME}:/data/db ` +
+          `-v ${CONFIG.BACKUP_DIR}:/backups mongo ` +
+          `bash -c "mongorestore --uri='${CONFIG.MONGO_URI}' --gzip --archive=/backups/${backup.filename}"`,
         { stdio: "inherit" }
       );
 
-      // 2. Copiar backup al contenedor
-      execSync(
-        `docker cp "${latestBackup.path}" ${this.config.CONTAINER_NAME}:${containerRestorePath}`,
-        { stdio: "inherit" }
-      );
-
-      // 3. Ejecutar restore
-      execSync(
-        `docker exec ${this.config.CONTAINER_NAME} ` +
-          `mongorestore --uri="${this.config.MONGO_URI}" ` +
-          `--dir="${containerRestorePath}" --drop`,
-        { stdio: "inherit" }
-      );
-
-      // 4. Limpiar contenedor
-      execSync(
-        `docker exec ${this.config.CONTAINER_NAME} rm -rf ${join(
-          this.config.CONTAINER_BACKUP_DIR,
-          "restore"
-        )}`,
-        { stdio: "inherit" }
-      );
-
-      // Actualizar estado
+      // 3. Actualizar estado
       await collection.updateOne(
-        { _id: latestBackup._id },
+        { _id: backup._id },
         { $set: { status: "restored" } }
       );
+
+      // 4. Reiniciar contenedor
+      execSync(`docker start ${CONFIG.CONTAINER_NAME}`, { stdio: "inherit" });
+
+      logger.info("Restauración completada exitosamente");
     } catch (error) {
-      console.error("Error en restauración:", error);
+      logger.error("Error en restauración:", error);
       throw error;
     } finally {
       await client.close();
@@ -198,41 +211,44 @@ class DisasterRecoveryManager {
   }
 
   public async startMonitoring(): Promise<void> {
-    console.log("Iniciando monitorización del sistema...");
+    logger.info("Iniciando sistema de monitorización...");
 
     while (true) {
       try {
-        const hasRecentSales = await this.checkRecentSales();
+        const hasSales = await this.checkRecentSales();
 
-        if (!hasRecentSales) {
+        if (!hasSales) {
           const hasProblems = this.showDialog();
 
-          if (!hasProblems) {
-            await this.createBackup();
-            console.log("✅ Backup preventivo creado correctamente");
+          if (hasProblems) {
+            logger.warn("Problemas detectados - Restaurando último backup");
+            await this.restoreLatestBackup();
           } else {
-            await this.restoreFromLatestBackup();
-            console.log("♻️ Sistema restaurado desde el último backup");
+            logger.info("Creando backup preventivo");
+            await this.createVolumeBackup();
           }
         }
-      } catch (error) {
-        console.error("⚠️ Error en monitorización:", error);
-      }
 
-      await new Promise((resolve) =>
-        setTimeout(resolve, this.config.CHECK_INTERVAL)
-      );
+        await this.delay(CONFIG.CHECK_INTERVAL);
+      } catch (error) {
+        logger.error("Error en ciclo de monitorización:", error);
+        await this.delay(10000); // Espera antes de reintentar
+      }
     }
+  }
+
+  private delay(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
   }
 }
 
 // Ejecución principal
 (async () => {
   try {
-    const manager = new DisasterRecoveryManager(CONFIG);
-    await manager.startMonitoring();
+    const recoverySystem = new DisasterRecoverySystem();
+    await recoverySystem.startMonitoring();
   } catch (error) {
-    console.error("🔥 Error crítico:", error);
+    logger.error("Error crítico:", error);
     process.exit(1);
   }
 })();
