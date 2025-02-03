@@ -5,13 +5,17 @@ BACKUP_DIR="$HOME/backups/tocgamedb"
 
 # 1. Crear directorio de backups sin sudo
 mkdir -p "$BACKUP_DIR"
-chmod 700 "$BACKUP_DIR"
+chmod 775 "$BACKUP_DIR"
+
+sudo chown -R $USER:docker "$BACKUP_DIR"
 
 # 2. Configurar permisos de Docker (evitar usar sudo)
 sudo groupadd docker 2>/dev/null  # Ignorar si ya existe
 sudo usermod -aG docker $USER
 
 # 3. Configuración sudoers segura
+sudo setfacl -Rdm g:docker:rwx "$BACKUP_DIR"
+
 SUDOERS_FILE="/etc/sudoers.d/disaster-recovery"
 echo "Defaults:$USER !requiretty" | sudo tee "$SUDOERS_FILE" >/dev/null
 echo "$USER ALL=(root) NOPASSWD: /usr/bin/docker exec *" | sudo tee -a "$SUDOERS_FILE" >/dev/null

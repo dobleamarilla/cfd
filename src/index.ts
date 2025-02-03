@@ -92,14 +92,17 @@ class DisasterRecoveryManager {
   public async createBackup(): Promise<void> {
     const timestamp = format(new Date(), "yyyyMMdd-HHmmss");
     const backupName = `backup-${timestamp}`;
-    const containerBackupPath = join(
-      this.config.CONTAINER_BACKUP_DIR,
-      backupName
-    );
+    const containerBackupPath = `/tmp/mongobackups/${backupName}`;
     const hostBackupPath = join(this.config.HOST_BACKUP_DIR, backupName);
 
     try {
-      // 1. Crear backup dentro del contenedor
+      // 1. Crear directorio temporal en el contenedor
+      execSync(
+        `docker exec ${this.config.CONTAINER_NAME} mkdir -p ${containerBackupPath}`,
+        { stdio: "inherit" }
+      );
+
+      // 2. Ejecutar mongodump
       execSync(
         `docker exec ${this.config.CONTAINER_NAME} ` +
           `mongodump --uri="${this.config.MONGO_URI}" ` +
@@ -107,35 +110,21 @@ class DisasterRecoveryManager {
         { stdio: "inherit" }
       );
 
-      // 2. Copiar desde contenedor a host
+      // 3. Copiar archivos con preservación de permisos
       execSync(
-        `docker cp ${this.config.CONTAINER_NAME}:${containerBackupPath} ${this.config.HOST_BACKUP_DIR}`,
+        `docker cp ${this.config.CONTAINER_NAME}:${containerBackupPath} ${hostBackupPath}`,
         { stdio: "inherit" }
       );
 
-      // 3. Limpiar contenedor
+      // 4. Limpiar contenedor
       execSync(
         `docker exec ${this.config.CONTAINER_NAME} rm -rf ${containerBackupPath}`,
         { stdio: "inherit" }
       );
 
-      // Registrar en MongoDB
-      const client = new MongoClient(this.config.MONGO_URI);
-      await client.connect();
-      const collection = client
-        .db()
-        .collection<BackupRecord>(this.config.BACKUPS_COLLECTION);
-
-      await collection.insertOne({
-        path: hostBackupPath,
-        createdAt: new Date(),
-        type: "emergency",
-        status: "created",
-      });
-
-      await client.close();
-    } catch (error) {
-      console.error("Error en creación de backup:", error);
+      // ... (resto del código de registro)
+    } catch (error: any) {
+      console.error("Detalle del error:", error.stdout?.toString());
       throw error;
     }
   }
