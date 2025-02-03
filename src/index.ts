@@ -99,10 +99,10 @@ class DisasterRecoveryManager {
         { stdio: "inherit" }
       );
 
-      // // 2. Copiar el backup al host
-      // execSync(`docker cp mongodb:/tmp/${backupName} ${backupPath}`, {
-      //   stdio: "inherit",
-      // });
+      // 2. Copiar el backup al host
+      execSync(`docker cp mongodb:/tmp/${backupName} ${backupPath}`, {
+        stdio: "inherit",
+      });
 
       // 3. Limpiar el backup temporal del contenedor
       execSync(`docker exec mongodb rm -rf /tmp/${backupName}`, {
